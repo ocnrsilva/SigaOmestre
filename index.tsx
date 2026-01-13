@@ -3,28 +3,20 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 
-const initApp = () => {
-  const rootElement = document.getElementById('root');
-  if (!rootElement) {
-    console.error("Erro crítico: Elemento #root não encontrado no DOM.");
-    return;
-  }
-
-  try {
-    const root = ReactDOM.createRoot(rootElement);
+const start = () => {
+  const container = document.getElementById('root');
+  if (container) {
+    const root = ReactDOM.createRoot(container);
     root.render(
       <React.StrictMode>
         <App />
       </React.StrictMode>
     );
-  } catch (error) {
-    console.error("Erro ao renderizar a aplicação React:", error);
   }
 };
 
-// Garante que o DOM está carregado antes de iniciar o React
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initApp);
+if (document.readyState === 'complete') {
+  start();
 } else {
-  initApp();
+  window.addEventListener('load', start);
 }
