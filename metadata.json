@@ -1,0 +1,7 @@
+{
+  "name": "Siga o Mestre",
+  "description": "Um aplicativo de comboio inteligente para viagens em grupo, permitindo seguir a rota exata de um líder em tempo real ou posteriormente.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
