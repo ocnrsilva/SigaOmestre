@@ -1,9 +1,9 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { UserRole, Trip, GeoPoint, Destination } from './types';
 import MapComponent from './components/MapComponent';
 import { storageService } from './services/storage';
-import { Navigation, Play, Share2, Users, MapPin, ChevronUp, Copy, Check, LogOut, Search, Loader2, ArrowLeft, History, Clock, ChevronDown, Volume2, VolumeX } from 'lucide-react';
+import { Navigation, Play, Share2, Users, MapPin, ChevronUp, Copy, Check, LogOut, Search, Loader2, ArrowLeft, Volume2, VolumeX, ChevronDown, AlertCircle, RefreshCw, X, Zap } from 'lucide-react';
 import { GoogleGenAI, Type } from "@google/genai";
 
 const calculateDistance = (p1: GeoPoint | {lat: number, lng: number}, p2: GeoPoint | {lat: number, lng: number}) => {
@@ -28,6 +28,7 @@ const App: React.FC = () => {
   const [suggestions, setSuggestions] = useState<Destination[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isCalculatingRoute, setIsCalculatingRoute] = useState(false);
+  const [routeLoadingStatus, setRouteLoadingStatus] = useState('');
   const [selectedDest, setSelectedDest] = useState<Destination | null>(null);
   const [plannedRoute, setPlannedRoute] = useState<[number, number][]>([]);
   const [routeSteps, setRouteSteps] = useState<any[]>([]);
@@ -37,259 +38,184 @@ const App: React.FC = () => {
   const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
 
   const watchIdRef = useRef<number | null>(null);
-  const simulationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lastRecordedPosRef = useRef<GeoPoint | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchControllerRef = useRef<AbortController | null>(null);
+  const lastRecordedPosRef = useRef<GeoPoint | null>(null);
   
-  const lastSpokenStepIndexRef = useRef<number>(-1);
-  const lastSpokenMilestoneRef = useRef<'far' | 'near' | null>(null);
-  const lastRouteStartPosRef = useRef<GeoPoint | null>(null);
-  const lastRouteDestIdRef = useRef<string | null>(null);
+  const stateRef = useRef({ plannedRoute, isCalculatingRoute, selectedDest, userPos, role, currentTrip });
+  useEffect(() => {
+    stateRef.current = { plannedRoute, isCalculatingRoute, selectedDest, userPos, role, currentTrip };
+  }, [plannedRoute, isCalculatingRoute, selectedDest, userPos, role, currentTrip]);
 
-  const speak = (text: string) => {
+  const speak = useCallback((text: string) => {
     if (!isVoiceEnabled) return;
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'pt-BR';
-    utterance.rate = 1.1;
     window.speechSynthesis.speak(utterance);
-  };
+  }, [isVoiceEnabled]);
 
-  const fetchRoadRoute = async (start: GeoPoint, end: Destination, retryCount = 0) => {
-    if (isCalculatingRoute && retryCount === 0) return;
-    
+  const updateRoute = async (start: GeoPoint, end: Destination) => {
+    if (stateRef.current.plannedRoute.length === 0) {
+      setPlannedRoute([[start.lat, start.lng], [end.lat, end.lng]]);
+    }
+
+    if (fetchControllerRef.current) fetchControllerRef.current.abort();
+    fetchControllerRef.current = new AbortController();
+
     setIsCalculatingRoute(true);
-    lastRouteStartPosRef.current = start;
-    lastRouteDestIdRef.current = `${end.lat},${end.lng}`;
-    
+    setRouteLoadingStatus('Otimizando percurso...');
+
     try {
-      // Usando OSRM com geometria completa para seguir as ruas
-      const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&steps=true&language=pt`);
-      
-      if (!response.ok) throw new Error("Erro no servidor de mapas");
-      
+      const url = `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&steps=true&language=pt`;
+      const response = await fetch(url, { signal: fetchControllerRef.current.signal });
       const data = await response.json();
-      if (data.routes && data.routes.length > 0) {
+
+      if (data.routes && data.routes[0]) {
         const route = data.routes[0];
-        // OSRM retorna [lng, lat], precisamos de [lat, lng] para o Leaflet
-        const coords = route.geometry.coordinates.map((coord: [number, number]) => [coord[1], coord[0]] as [number, number]);
+        const coords: [number, number][] = route.geometry.coordinates.map((c: any) => [c[1], c[0]]);
         
-        if (coords.length < 2) throw new Error("Geometria de rota inválida");
-        
-        setRouteSteps(route.legs[0].steps || []);
-        setPlannedRoute(coords);
-        setError(null);
-      } else {
-        throw new Error("Nenhuma rota encontrada pelas ruas");
+        if (coords.length >= 2) {
+          setPlannedRoute(coords);
+          setRouteSteps(route.legs[0].steps || []);
+          setCurrentStepIndex(0);
+          setError(null);
+          
+          if (stateRef.current.role === UserRole.MESTRE && stateRef.current.currentTrip) {
+            const updated = { ...stateRef.current.currentTrip, plannedRoute: coords };
+            storageService.saveTrip(updated);
+            setCurrentTrip(updated);
+          }
+        }
       }
-    } catch (e) {
-      console.error("Erro ao traçar rota:", e);
-      if (retryCount < 2) {
-        setTimeout(() => fetchRoadRoute(start, end, retryCount + 1), 1000);
-      } else {
-        // Fallback final: Linha reta (apenas se tudo mais falhar)
-        const fallbackRoute: [number, number][] = [[start.lat, start.lng], [end.lat, end.lng]];
-        setPlannedRoute(fallbackRoute);
-        setRouteSteps([{ maneuver: { instruction: "Siga em linha reta até o destino", location: [end.lng, end.lat] } }]);
-        setError("Não foi possível carregar o caminho exato. Usando linha reta.");
+    } catch (e: any) {
+      if (e.name !== 'AbortError') {
+        setRouteLoadingStatus('Modo Direto Ativado');
       }
     } finally {
-      if (retryCount >= 0) setIsCalculatingRoute(false);
+      setIsCalculatingRoute(false);
     }
   };
 
+  // GPS E GRAVAÇÃO DE RASTRO
   useEffect(() => {
-    if ("geolocation" in navigator) {
-      const id = navigator.geolocation.watchPosition(
-        (position) => {
-          const newPoint: GeoPoint = {
-            lat: position.coords.latitude,
-            lng: position.coords.longitude,
-            timestamp: Date.now()
-          };
-          setUserPos(newPoint);
+    if (!("geolocation" in navigator)) return;
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const newPoint = { lat: pos.coords.latitude, lng: pos.coords.longitude, timestamp: Date.now() };
+        setUserPos(newPoint);
 
-          if (role === UserRole.MESTRE && currentTrip?.isActive) {
-            const distanceMoved = lastRecordedPosRef.current ? calculateDistance(lastRecordedPosRef.current, newPoint) : Infinity;
-            if (distanceMoved > 5) {
-              const updated = storageService.updateTripPath(currentTrip.code, newPoint);
-              if (updated) {
-                setCurrentTrip({...updated});
-                lastRecordedPosRef.current = newPoint;
-              }
+        const { role, currentTrip } = stateRef.current;
+
+        // SE FOR MESTRE: Grava o rastro se moveu mais de 10 metros
+        if (role === UserRole.MESTRE && currentTrip?.isActive) {
+          if (!lastRecordedPosRef.current || calculateDistance(lastRecordedPosRef.current, newPoint) > 10) {
+            const updatedTrip = storageService.updateTripPath(currentTrip.code, newPoint);
+            if (updatedTrip) {
+              setCurrentTrip({ ...updatedTrip });
+              lastRecordedPosRef.current = newPoint;
             }
           }
-
-          if (currentTrip?.isActive && routeSteps.length > 0) {
-            const nextStep = routeSteps[currentStepIndex];
-            if (nextStep) {
-              const stepPos = { lat: nextStep.maneuver.location[1], lng: nextStep.maneuver.location[0] };
-              const distToStep = calculateDistance(newPoint, stepPos);
-
-              if (distToStep <= 200 && distToStep > 50) {
-                if (lastSpokenStepIndexRef.current !== currentStepIndex || lastSpokenMilestoneRef.current !== 'far') {
-                  speak(`Em duzentos metros, ${nextStep.maneuver.instruction}`);
-                  lastSpokenStepIndexRef.current = currentStepIndex;
-                  lastSpokenMilestoneRef.current = 'far';
-                }
-              }
-              
-              if (distToStep <= 45) {
-                if (lastSpokenMilestoneRef.current !== 'near') {
-                  speak(nextStep.maneuver.instruction);
-                  lastSpokenStepIndexRef.current = currentStepIndex;
-                  lastSpokenMilestoneRef.current = 'near';
-                  
-                  if (currentStepIndex < routeSteps.length - 1) {
-                    setTimeout(() => {
-                        setCurrentStepIndex(prev => prev + 1);
-                        lastSpokenMilestoneRef.current = null;
-                    }, 4000);
-                  }
-                }
-              }
-            }
-          }
-        },
-        () => setError("Ative o GPS para navegar."),
-        { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
-      );
-      watchIdRef.current = id;
-    }
-    return () => { if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current); };
-  }, [role, currentTrip, routeSteps, currentStepIndex]);
-
-  useEffect(() => {
-    if (role === UserRole.SEGUIDOR && currentTrip) {
-      simulationIntervalRef.current = setInterval(() => {
-        const trip = storageService.getTripByCode(currentTrip.code);
-        if (trip) {
-          setCurrentTrip({...trip});
-          if (trip.path.length > 0) setMasterPos(trip.path[trip.path.length - 1]);
         }
-      }, 3000);
-    }
-    return () => { if (simulationIntervalRef.current) clearInterval(simulationIntervalRef.current); };
-  }, [role, currentTrip]);
+      },
+      null,
+      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+    );
+    return () => { if (watchIdRef.current) navigator.geolocation.clearWatch(watchIdRef.current); };
+  }, []);
+
+  // SINCRONIZAÇÃO DO SEGUIDOR (Simula recebimento de dados do mestre)
+  useEffect(() => {
+    if (role !== UserRole.SEGUIDOR || !currentTrip) return;
+
+    const syncInterval = setInterval(() => {
+      const masterTrip = storageService.getTripByCode(currentTrip.code);
+      if (masterTrip && masterTrip.isActive) {
+        // Pega a última posição conhecida do mestre no rastro
+        if (masterTrip.path.length > 0) {
+          const lastPoint = masterTrip.path[masterTrip.path.length - 1];
+          setMasterPos(lastPoint);
+        }
+        // Atualiza o rastro e a rota no mapa do seguidor
+        setCurrentTrip({ ...masterTrip });
+        setPlannedRoute(masterTrip.plannedRoute || []);
+      } else if (masterTrip && !masterTrip.isActive) {
+        speak("O comboio foi encerrado pelo mestre.");
+        setRole(UserRole.NONE);
+        setCurrentTrip(null);
+      }
+    }, 3000); // Sincroniza a cada 3 segundos
+
+    return () => clearInterval(syncInterval);
+  }, [role, currentTrip?.code]);
 
   useEffect(() => {
-    if (selectedDest && searchQuery === selectedDest.name) {
-      setSuggestions([]);
-      return;
+    if (selectedDest && userPos && isConfiguringTrip) {
+      updateRoute(userPos, selectedDest);
     }
-    if (searchQuery.length < 3) {
-      setSuggestions([]);
-      return;
-    }
+  }, [selectedDest, isConfiguringTrip]);
+
+  useEffect(() => {
+    if (selectedDest && searchQuery === selectedDest.name) return;
+    if (searchQuery.length < 3) { setSuggestions([]); return; }
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
     debounceTimerRef.current = setTimeout(async () => {
       setIsSearching(true);
       try {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const locationContext = userPos ? `Lat: ${userPos.lat}, Lng: ${userPos.lng}. ` : "";
-        const response = await ai.models.generateContent({
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
+        const resp = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: `Sugira 5 locais reais para: "${searchQuery}". ${locationContext}Priorize o mesmo estado do usuário. JSON: name, address, lat, lng.`,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  lat: { type: Type.NUMBER },
-                  lng: { type: Type.NUMBER },
-                  name: { type: Type.STRING },
-                  address: { type: Type.STRING }
-                },
-                required: ["lat", "lng", "name", "address"]
-              }
-            }
-          }
+          contents: `Ache 5 lugares: "${searchQuery}" perto de ${userPos?.lat}, ${userPos?.lng}. JSON com name, address, lat, lng.`,
+          config: { responseMimeType: "application/json" }
         });
-        setSuggestions(JSON.parse(response.text));
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setIsSearching(false);
-      }
-    }, 600);
-    return () => { if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current); };
-  }, [searchQuery, userPos, selectedDest]);
+        if (resp?.text) setSuggestions(JSON.parse(resp.text));
+      } catch (e) { console.error(e); } finally { setIsSearching(false); }
+    }, 1000);
+  }, [searchQuery]);
 
-  useEffect(() => {
-    if (selectedDest && userPos) {
-      const destId = `${selectedDest.lat},${selectedDest.lng}`;
-      const distFromLastCalc = lastRouteStartPosRef.current ? calculateDistance(userPos, lastRouteStartPosRef.current) : Infinity;
-      
-      // Só recalcula se o destino mudou ou se o usuário se afastou muito do ponto de origem do cálculo
-      if (destId !== lastRouteDestIdRef.current || distFromLastCalc > 100 || plannedRoute.length === 0) {
-        fetchRoadRoute(userPos, selectedDest);
-      }
-    }
-  }, [selectedDest, userPos?.lat, userPos?.lng]);
-
-  const handleSelectSuggestion = (suggestion: Destination) => {
-    setSelectedDest(suggestion);
-    setSearchQuery(suggestion.name);
-    setSuggestions([]);
-    setPlannedRoute([]); // Força novo cálculo detalhado
-  };
-
-  const handleStartTrip = async () => {
-    if (!selectedDest || isCalculatingRoute) return;
-    
-    // Se a rota ainda estiver em linha reta, tenta um último fetch rápido ou usa o que tem
+  const handleStartTrip = () => {
+    if (!selectedDest) return;
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
     const newTrip: Trip = {
       id: Date.now().toString(),
       code,
-      name: "Comboio Siga o Mestre",
+      name: `Comboio para ${selectedDest.name}`,
       masterId: "me",
       destination: selectedDest,
       plannedRoute: plannedRoute,
-      path: userPos ? [userPos] : [],
+      path: userPos ? [userPos] : [], // Primeiro ponto do rastro
       isActive: true,
       createdAt: Date.now()
     };
-
     storageService.saveTrip(newTrip);
     setCurrentTrip(newTrip);
-    lastRecordedPosRef.current = userPos;
     setRole(UserRole.MESTRE);
     setIsConfiguringTrip(false);
     setIsBottomSheetOpen(false);
-    setCurrentStepIndex(0);
-    lastSpokenStepIndexRef.current = -1;
-    lastSpokenMilestoneRef.current = null;
-
-    speak("Comboio iniciado. Siga o traçado azul no mapa.");
+    speak("Comboio iniciado. Seu rastro está sendo gravado.");
   };
 
   if (role === UserRole.NONE && !isConfiguringTrip) {
     return (
       <div className="h-full w-full bg-slate-900 flex flex-col items-center justify-center p-6 text-white overflow-hidden">
         <div className="mb-12 text-center">
-          <div className="bg-blue-600 w-20 h-20 rounded-3xl flex items-center justify-center mx-auto mb-6 shadow-2xl">
-            <Navigation size={40} className="text-white" />
+          <div className="bg-blue-600 w-24 h-24 rounded-[2.5rem] flex items-center justify-center mx-auto mb-8 shadow-[0_0_50px_rgba(37,99,235,0.4)]">
+            <Navigation size={48} className="text-white fill-white/20" />
           </div>
-          <h1 className="text-4xl font-extrabold mb-3 tracking-tight">Siga o Mestre</h1>
-          <p className="text-slate-400">Comboio inteligente em tempo real.</p>
+          <h1 className="text-5xl font-black mb-3 tracking-tighter">Siga o Mestre</h1>
+          <p className="text-slate-400 text-lg">Navegação em grupo sem atrasos.</p>
         </div>
         <div className="w-full max-w-sm space-y-4">
-          <button onClick={() => { setIsConfiguringTrip(true); setSelectedDest(null); setPlannedRoute([]); setSearchQuery(''); }} className="w-full bg-blue-600 text-white font-bold py-5 px-6 rounded-2xl flex items-center justify-between shadow-xl active:scale-95 transition-all">
-            <div className="flex items-center"><Play size={24} className="mr-4 fill-white"/> Criar Comboio (Mestre)</div>
-            <ChevronUp className="rotate-90 opacity-40" />
+          <button onClick={() => setIsConfiguringTrip(true)} className="w-full bg-blue-600 text-white font-black py-6 px-6 rounded-3xl flex items-center justify-between shadow-xl active:scale-95 transition-all">
+            <div className="flex items-center"><Play size={28} className="mr-4 fill-white"/> Criar Comboio</div>
+            <Zap size={20} className="text-blue-200 animate-pulse" />
           </button>
-          <div className="relative py-6">
-            <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-800"></div></div>
-            <div className="relative flex justify-center text-xs"><span className="bg-slate-900 px-4 text-slate-500 font-bold tracking-widest uppercase">Ou</span></div>
-          </div>
-          <input type="text" placeholder="Código do Comboio" className="w-full bg-slate-800 border border-slate-700 rounded-2xl px-5 py-5 text-white uppercase text-center text-xl font-mono tracking-widest focus:ring-2 focus:ring-blue-500 transition-all" value={inputCode} onChange={(e) => setInputCode(e.target.value)} />
-          <button onClick={() => { const trip = storageService.getTripByCode(inputCode); if(trip){ setCurrentTrip(trip); setRole(UserRole.SEGUIDOR); setPlannedRoute(trip.plannedRoute || []); setIsBottomSheetOpen(false); }else{ setError("Código não encontrado."); } }} disabled={!inputCode} className="w-full bg-white text-slate-900 font-bold py-5 px-6 rounded-2xl flex items-center justify-center active:scale-95 transition-all disabled:opacity-50">
-            <Users size={24} className="mr-3" /> Entrar como Seguidor
+          <div className="relative py-4"><div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-800"></div></div><div className="relative flex justify-center text-xs text-slate-500 uppercase font-black"><span className="bg-slate-900 px-4">Ou entre em um</span></div></div>
+          <input type="text" placeholder="CÓDIGO" className="w-full bg-slate-800 border-2 border-slate-700 rounded-2xl px-5 py-5 text-white uppercase text-center text-2xl font-mono font-black tracking-widest outline-none focus:border-blue-500 transition-all placeholder:opacity-20" value={inputCode} onChange={(e) => setInputCode(e.target.value)} />
+          <button onClick={() => { const trip = storageService.getTripByCode(inputCode); if(trip){ setCurrentTrip(trip); setRole(UserRole.SEGUIDOR); setPlannedRoute(trip.plannedRoute || []); setMasterPos(trip.path.length > 0 ? trip.path[trip.path.length-1] : null); setIsBottomSheetOpen(false); }else{ setError("Código inválido."); } }} disabled={!inputCode} className="w-full bg-white text-slate-900 font-black py-5 px-6 rounded-2xl flex items-center justify-center active:scale-95 transition-all shadow-xl">
+             Entrar como Seguidor
           </button>
-          {error && <p className="text-red-400 text-sm text-center mt-2 font-bold">{error}</p>}
+          {error && <div className="text-red-400 text-center font-bold text-sm">{error}</div>}
         </div>
       </div>
     );
@@ -298,50 +224,30 @@ const App: React.FC = () => {
   if (isConfiguringTrip) {
     return (
       <div className="fixed inset-0 flex flex-col bg-white overflow-hidden z-[2000]">
-        <div className="relative h-16 bg-slate-900 text-white flex items-center px-4 shrink-0 z-50 shadow-lg">
-          <button onClick={() => setIsConfiguringTrip(false)} className="flex items-center text-slate-400 px-2">
-            <ArrowLeft className="mr-2" size={20} /> Voltar
-          </button>
-          <div className="flex-1 text-center font-bold text-lg">Definir Destino</div>
+        <div className="h-16 bg-slate-900 text-white flex items-center px-4 shrink-0 z-[3000]">
+          <button onClick={() => { setIsConfiguringTrip(false); setSelectedDest(null); setPlannedRoute([]); if(fetchControllerRef.current) fetchControllerRef.current.abort(); }} className="flex items-center text-slate-400 font-bold"><ArrowLeft className="mr-2" size={20} /> Cancelar</button>
+          <div className="flex-1 text-center font-black">Definir Destino</div>
           <div className="w-10"></div>
         </div>
-
         <div className="flex-grow relative w-full overflow-hidden">
           <MapComponent 
             userPos={userPos} 
-            masterPos={null} 
             trip={selectedDest ? { destination: selectedDest, plannedRoute: plannedRoute, path: [] } as any : null} 
             role={UserRole.MESTRE}
-            onMapClick={(lat, lng) => handleSelectSuggestion({ lat, lng, name: "Local Selecionado", address: "Localização personalizada no mapa" })}
-            isSelectingDestination={true}
+            onMapClick={(lat, lng) => { setSelectedDest({ lat, lng, name: "Local no Mapa" }); setPlannedRoute([]); }}
+            isSelectingDestination={true} masterPos={null}
           />
-          
-          <div className="absolute top-4 left-4 right-4 z-[3000]">
-            <div className="relative flex shadow-2xl bg-white rounded-2xl overflow-hidden border border-slate-100">
-              <div className="flex items-center pl-4 text-slate-400">
-                {isSearching ? <Loader2 size={20} className="animate-spin text-blue-500" /> : <Search size={20} />}
-              </div>
-              <input 
-                type="text" 
-                placeholder="Para onde vamos?" 
-                className="w-full px-4 py-5 border-none focus:ring-0 text-slate-900 font-medium placeholder:text-slate-400"
-                value={searchQuery}
-                onChange={(e) => {
-                    setSearchQuery(e.target.value);
-                    if(selectedDest && e.target.value !== selectedDest.name) {
-                      setSelectedDest(null);
-                      setPlannedRoute([]);
-                    }
-                }}
-              />
+          <div className="absolute top-4 left-4 right-4 z-[4000]">
+            <div className="relative flex shadow-2xl bg-white rounded-2xl overflow-hidden border border-slate-100 p-1">
+              <div className="flex items-center pl-4 text-slate-400">{isSearching ? <Loader2 size={24} className="animate-spin text-blue-500" /> : <Search size={24} />}</div>
+              <input type="text" placeholder="Pesquisar endereço ou local..." className="w-full px-4 py-5 border-none focus:ring-0 text-slate-900 font-bold" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
             </div>
-
             {suggestions.length > 0 && !selectedDest && (
-              <div className="mt-2 bg-white rounded-2xl shadow-2xl border border-slate-100 overflow-hidden max-h-[60vh] overflow-y-auto">
+              <div className="mt-2 bg-white rounded-2xl shadow-2xl border border-slate-100 overflow-hidden max-h-[50vh] overflow-y-auto">
                 {suggestions.map((item, idx) => (
-                  <button key={idx} onClick={() => handleSelectSuggestion(item)} className="w-full px-5 py-4 flex items-start space-x-4 hover:bg-slate-50 border-b border-slate-50 last:border-b-0 text-left">
-                    <MapPin size={18} className="text-slate-400 mt-1 shrink-0" />
-                    <div className="flex-1 min-w-0">
+                  <button key={idx} onClick={() => { setSelectedDest(item); setSearchQuery(item.name); setSuggestions([]); }} className="w-full px-5 py-4 flex items-start space-x-4 hover:bg-blue-50 border-b border-slate-50 text-left">
+                    <MapPin size={20} className="text-slate-400 mt-1" />
+                    <div className="flex-1 truncate">
                       <div className="font-bold text-slate-900 truncate">{item.name}</div>
                       <div className="text-xs text-slate-400 truncate">{item.address}</div>
                     </div>
@@ -350,27 +256,20 @@ const App: React.FC = () => {
               </div>
             )}
           </div>
-
           {selectedDest && (
-            <div className="absolute bottom-6 left-4 right-4 z-[2000] bg-white p-6 rounded-3xl shadow-[0_20px_60px_rgba(0,0,0,0.3)] animate-in slide-in-from-bottom duration-300">
-              {error && <div className="bg-amber-50 text-amber-700 text-[10px] font-bold p-2 rounded-lg mb-3 border border-amber-200">{error}</div>}
+            <div className="absolute bottom-8 left-4 right-4 z-[4000] bg-white p-6 rounded-[2.5rem] shadow-2xl border border-slate-50 animate-in slide-in-from-bottom duration-500">
               <div className="flex items-start space-x-4 mb-6">
-                <div className="bg-blue-100 p-3 rounded-2xl shrink-0">
-                  {isCalculatingRoute ? <Loader2 className="text-blue-600 animate-spin" size={28} /> : <MapPin className="text-blue-600" size={28} />}
+                <div className="bg-blue-600 p-4 rounded-2xl shrink-0 text-white shadow-lg">
+                   {isCalculatingRoute ? <Loader2 className="animate-spin" size={32} /> : <MapPin size={32} />}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="text-[10px] font-black text-blue-600 uppercase mb-1">
-                    {isCalculatingRoute ? 'Traçando Caminho pelas ruas...' : 'Destino Selecionado'}
-                  </div>
-                  <div className="text-slate-900 font-extrabold text-xl leading-tight truncate">{selectedDest.name}</div>
+                  <div className="text-[10px] font-black text-blue-600 uppercase tracking-widest mb-1">{isCalculatingRoute ? routeLoadingStatus : 'Destino Selecionado'}</div>
+                  <div className="text-slate-900 font-black text-2xl truncate leading-tight">{selectedDest.name}</div>
+                  {!isCalculatingRoute && <div className="text-xs text-green-600 font-bold flex items-center mt-1"><Check size={14} className="mr-1"/> Percurso pronto</div>}
                 </div>
               </div>
-              <button 
-                onClick={handleStartTrip} 
-                disabled={isCalculatingRoute}
-                className={`w-full text-white font-black py-5 rounded-2xl shadow-xl active:scale-95 transition-all flex items-center justify-center text-lg ${isCalculatingRoute ? 'bg-slate-400' : 'bg-blue-600 hover:bg-blue-700'}`}
-              >
-                {isCalculatingRoute ? 'Aguarde o cálculo...' : 'Iniciar Comboio'}
+              <button onClick={handleStartTrip} className="w-full bg-blue-600 text-white font-black py-6 rounded-3xl shadow-[0_15px_30px_rgba(37,99,235,0.3)] active:scale-95 transition-all text-xl">
+                Iniciar Comboio Agora
               </button>
             </div>
           )}
@@ -380,84 +279,54 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="fixed inset-0 w-full h-full overflow-hidden">
+    <div className="fixed inset-0 w-full h-full overflow-hidden bg-slate-900">
       <MapComponent userPos={userPos} masterPos={masterPos} trip={currentTrip} role={role} />
-
-      <div className="absolute top-4 left-4 right-4 z-[500] flex flex-col space-y-2">
-        <div className="bg-white/95 backdrop-blur-md rounded-2xl p-4 shadow-xl flex items-center justify-between border border-white/40">
-          <div className="flex items-center space-x-3">
-            <div className={`${role === UserRole.MESTRE ? 'bg-blue-600' : 'bg-red-500'} w-11 h-11 rounded-2xl flex items-center justify-center text-white shadow-lg`}>
+      
+      <div className="absolute top-4 left-4 right-4 z-[500] flex flex-col space-y-3 pointer-events-none">
+        <div className="bg-white/95 backdrop-blur-xl rounded-[2rem] p-4 shadow-2xl flex items-center justify-between border border-white pointer-events-auto">
+          <div className="flex items-center space-x-4">
+            <div className={`${role === UserRole.MESTRE ? 'bg-blue-600' : 'bg-red-500'} w-12 h-12 rounded-2xl flex items-center justify-center text-white shadow-lg text-2xl`}>
               {role === UserRole.MESTRE ? '👑' : '🚗'}
             </div>
             <div>
-              <h2 className="font-extrabold text-slate-900 leading-none">
-                {role === UserRole.MESTRE ? 'Mestre' : 'Seguidor'}
-              </h2>
-              <div className="flex items-center text-[10px] text-green-600 font-black uppercase tracking-widest mt-1">
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse mr-2"></div> AO VIVO
-              </div>
+              <h2 className="font-black text-slate-900 text-lg leading-tight">{role === UserRole.MESTRE ? 'Líder' : 'Seguindo'}</h2>
+              <div className="flex items-center text-[10px] text-green-600 font-black uppercase tracking-widest mt-1"><div className="w-2 h-2 bg-green-500 rounded-full animate-pulse mr-2"></div> AO VIVO</div>
             </div>
           </div>
           <div className="flex items-center space-x-2">
-             <button onClick={() => setIsVoiceEnabled(!isVoiceEnabled)} className={`p-3 rounded-xl transition-all ${isVoiceEnabled ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-400'}`}>
-               {isVoiceEnabled ? <Volume2 size={22} /> : <VolumeX size={22} />}
+             <button onClick={() => setIsVoiceEnabled(!isVoiceEnabled)} className={`p-3.5 rounded-2xl transition-all ${isVoiceEnabled ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-400'}`}>
+               {isVoiceEnabled ? <Volume2 size={24} /> : <VolumeX size={24} />}
              </button>
-             <button onClick={() => { setRole(UserRole.NONE); setCurrentTrip(null); }} className="p-3 text-slate-400 hover:text-red-500 bg-slate-50 rounded-xl shadow-inner active:scale-90">
-               <LogOut size={22} />
+             <button onClick={() => { if(window.confirm("Sair do comboio?")) { setRole(UserRole.NONE); setCurrentTrip(null); setPlannedRoute([]); } }} className="p-3.5 text-slate-400 bg-slate-50 rounded-2xl shadow-inner active:scale-90">
+               <LogOut size={24} />
              </button>
           </div>
         </div>
-
-        {currentTrip?.isActive && routeSteps[currentStepIndex] && (
-          <div className="bg-blue-600 text-white p-4 rounded-2xl shadow-2xl border-b-4 border-blue-700 animate-in slide-in-from-top">
-            <div className="flex items-center space-x-4">
-               <div className="bg-white/20 p-2 rounded-lg"><Navigation size={24} className="rotate-45" /></div>
-               <div className="flex-1">
-                  <div className="text-xs font-bold text-blue-100 uppercase tracking-tight">Próxima Manobra</div>
-                  <div className="font-bold text-lg leading-tight">{routeSteps[currentStepIndex].maneuver.instruction}</div>
-               </div>
-            </div>
-          </div>
-        )}
+        {isCalculatingRoute && <div className="self-center bg-blue-600/90 backdrop-blur-md text-white px-6 py-2 rounded-full font-black text-[10px] uppercase tracking-widest shadow-lg animate-pulse border border-white/20 pointer-events-none">Ajustando percurso...</div>}
       </div>
 
-      <div className={`absolute bottom-0 left-0 right-0 bg-white shadow-2xl rounded-t-[40px] z-[1000] transition-all duration-500 ${isBottomSheetOpen ? 'translate-y-0' : 'translate-y-[calc(100%-80px)]'}`}>
-        <div className="w-full flex flex-col items-center py-4 cursor-pointer" onClick={() => setIsBottomSheetOpen(!isBottomSheetOpen)}>
-          <div className="w-14 h-1.5 bg-slate-200 rounded-full mb-1"></div>
-          {!isBottomSheetOpen && <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Painel de Viagem</div>}
-          {isBottomSheetOpen && <ChevronDown size={20} className="text-slate-300" />}
+      <div className={`absolute bottom-0 left-0 right-0 bg-white shadow-[0_-20px_60px_rgba(0,0,0,0.15)] rounded-t-[3.5rem] z-[1000] transition-all duration-700 ease-[cubic-bezier(0.23,1,0.32,1)] ${isBottomSheetOpen ? 'translate-y-0' : 'translate-y-[calc(100%-100px)]'}`}>
+        <div className="w-full flex flex-col items-center py-6 cursor-pointer" onClick={() => setIsBottomSheetOpen(!isBottomSheetOpen)}>
+          <div className="w-12 h-1.5 bg-slate-200 rounded-full mb-1"></div>
         </div>
-
-        <div className="px-6 pb-10 space-y-6">
-          <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
-            <div className="text-[10px] text-slate-400 font-black uppercase mb-1">Código do Grupo</div>
-            <div className="flex items-center justify-between">
-                <div className="text-3xl font-mono font-black text-blue-600 tracking-tighter">{currentTrip?.code}</div>
-                <button onClick={() => { navigator.clipboard.writeText(currentTrip?.code || ''); setCopied(true); setTimeout(() => setCopied(false), 2000); }} className="p-3 bg-white rounded-xl shadow-sm text-blue-600 active:scale-90">
-                  {copied ? <Check size={20} className="text-green-500" /> : <Copy size={20} />}
-                </button>
+        <div className="px-8 pb-12 space-y-6">
+          <div className="bg-slate-50 p-6 rounded-[2.5rem] border border-slate-100 flex items-center justify-between shadow-inner">
+            <div className="flex-1">
+               <div className="text-[10px] text-slate-400 font-black uppercase tracking-widest mb-1">Código de Acesso</div>
+               <div className="text-4xl font-mono font-black text-blue-600 tracking-tighter">{currentTrip?.code}</div>
             </div>
-          </div>
-
-          {currentTrip?.destination && (
-            <div className="flex items-center space-x-4 text-slate-600 bg-slate-50 p-4 rounded-2xl border border-slate-100">
-              <MapPin size={24} className="text-blue-500 shrink-0" />
-              <div className="flex-1 truncate">
-                <div className="text-[10px] font-black uppercase text-slate-400">Destino</div>
-                <div className="font-bold text-slate-800">{currentTrip.destination.name}</div>
-              </div>
-            </div>
-          )}
-
-          {role === UserRole.MESTRE && (
-            <button onClick={() => { if(currentTrip) storageService.saveTrip({...currentTrip, isActive: false}); setCurrentTrip(null); setRole(UserRole.NONE); }} className="w-full bg-red-500 text-white font-black py-5 rounded-2xl shadow-xl active:scale-95 transition-all text-lg">
-              Finalizar Viagem
+            <button onClick={() => { navigator.clipboard.writeText(currentTrip?.code || ''); setCopied(true); setTimeout(() => setCopied(false), 2000); }} className="p-5 bg-white rounded-3xl shadow-sm text-blue-600 active:scale-90 transition-all border border-slate-100">
+              {copied ? <Check size={24} className="text-green-500" /> : <Copy size={24} />}
             </button>
-          )}
-
-          <button className="w-full border-2 border-slate-100 py-4 rounded-2xl font-bold text-slate-500 flex items-center justify-center hover:bg-slate-50">
-            <Share2 className="mr-3" size={20} /> Compartilhar no WhatsApp
-          </button>
+          </div>
+          <div className="grid grid-cols-1 gap-4">
+            {role === UserRole.MESTRE && (
+              <button onClick={() => { if(window.confirm("Deseja encerrar o comboio para todos?")) { if(currentTrip) storageService.saveTrip({...currentTrip, isActive: false}); setCurrentTrip(null); setRole(UserRole.NONE); setPlannedRoute([]); } }} className="w-full bg-red-500 text-white font-black py-6 rounded-3xl shadow-xl active:scale-95 transition-all text-xl">Encerrar Viagem</button>
+            )}
+            <button onClick={() => window.open(`https://wa.me/?text=Siga meu comboio no Siga o Mestre! Use o código: ${currentTrip?.code}`, '_blank')} className="w-full border-2 border-slate-100 py-5 rounded-3xl font-black text-slate-600 flex items-center justify-center hover:bg-slate-50 transition-colors">
+              <Share2 className="mr-3 text-blue-500" size={24} /> Convidar via WhatsApp
+            </button>
+          </div>
         </div>
       </div>
     </div>
